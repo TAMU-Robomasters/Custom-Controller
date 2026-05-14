@@ -28,7 +28,8 @@ static const int BYTES_PER_SEG = 6;
 // respond rate limit (prevents ice mode)
 static const uint32_t MIN_REPLY_INTERVAL_MS = 10;
 
-// CRC tables (DJI serial comms protocol cmdid's)
+// CRC tables (verify data and prevent corruption)
+// replaces manual bit shifting
 static const uint8_t CRC8_INIT = 0xFF;
 static const uint16_t CRC16_INIT = 0xFFFF;
 
@@ -69,6 +70,11 @@ static const uint16_t CRC16_TAB[256] = {
   0xe70e,0xf687,0xc41c,0xd595,0xa12a,0xb0a3,0x8238,0x93b1,0x6b46,0x7acf,0x4854,0x59dd,0x2d62,0x3ceb,0x0e70,0x1ff9,
   0xf78f,0xe606,0xd49d,0xc514,0xb1ab,0xa022,0x92b9,0x8330,0x7bc7,0x6a4e,0x58d5,0x495c,0x3de3,0x2c6a,0x1ef1,0x0f78
 };
+
+static inline uint16_t crc16_update(uint16_t crc, uint8_t ch)
+{
+  return (uint16_t)((crc >> 8) ^ CRC16_TAB[(crc ^ ch) & 0xFF]);
+}
 
 static uint8_t crc8_calc(const uint8_t* msg, size_t len) {
   uint8_t crc = CRC8_INIT;
@@ -134,20 +140,23 @@ static void handleCompleteFrame(const uint8_t hdr[5], const uint8_t* b, uint16_t
   calc = crc16_calc(b, 2 + payloadLen);
 }
 
-static bool verifyCrc16(const uint8_t hdr[5], const uint8_t* b, uint16_t bLen) {
-  if (bLen < 4) return false;
-  uint16_t payloadLen = (uint16_t)(bLen - 4);
+static bool verifyCrc16_stream(const uint8_t hdr[5], const uint8_t* body, uint16_t bodyLen, uint16_t dataLen)
+{
+  if (bodyLen != (uint16_t)(2 + dataLen + 2)) return false;
+  if (dataLen > 256) return false;
 
-  // buffer: hdr(5) + cmd(2) + payload(payloadLen)
-  static uint8_t tmp[5 + 2 + 256];
-  if (payloadLen > 256) return false;
+  const uint16_t got = (uint16_t)body[2 + dataLen] | ((uint16_t)body[2 + dataLen + 1] << 8);
 
-  memcpy(tmp, hdr, 5);
-  memcpy(tmp + 5, b, 2 + payloadLen);
+  uint16_t crc = CRC16_INIT;
 
-  uint16_t got = (uint16_t)b[2 + payloadLen] | ((uint16_t)b[2 + payloadLen + 1] << 8);
-  uint16_t calc = crc16_calc(tmp, 5 + 2 + payloadLen);
-  return got == calc;
+  // header
+  for (int i = 0; i < 5; i++) crc = crc16_update(crc, hdr[i]);
+
+  // cmd_id + payload
+  const uint16_t n = (uint16_t)(2 + dataLen);
+  for (uint16_t i = 0; i < n; i++) crc = crc16_update(crc, body[i]);
+
+  return crc == got;
 }
 
 static void processUartByte(uint8_t ch) {
@@ -184,7 +193,7 @@ static void processUartByte(uint8_t ch) {
       else { resetParser(); break; }
 
       if (bodyHave == bodyNeed) {
-        if (verifyCrc16(header, body, bodyNeed)) {
+        if (verifyCrc16_stream(header, body, bodyNeed, dataLen)) {
           uint16_t cmd = (uint16_t)body[0] | ((uint16_t)body[1] << 8);
           if (cmd == 0x0302 && dataLen == 30) {
             memcpy(latestPayload, &body[2], 30);
